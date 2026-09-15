@@ -29,7 +29,8 @@ fn build_vendored(manifest_dir: &Path, out_dir: &Path, csrc_dir: &Path) {
     let litehtml_include = vendor_dir.join("include");
 
     // Gumbo (C99)
-    cc::Build::new()
+    let mut gumbo_build = cc::Build::new();
+    gumbo_build
         .cargo_metadata(false)
         .files(
             [
@@ -50,12 +51,25 @@ fn build_vendored(manifest_dir: &Path, out_dir: &Path, csrc_dir: &Path) {
         )
         .include(&gumbo_include)
         .include(&gumbo_private_include)
-        .std("c99")
-        .warnings(false)
-        .compile("gumbo");
+        .warnings(false);
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        // MSVC's CRT has no strings.h (a POSIX header gumbo's C89/C99 source
+        // uses for strcasecmp/strncasecmp) -- gumbo ships its own shim for
+        // exactly this under visualc/include (see litehtml's own CMake build,
+        // which adds this directory on Windows), but this Rust build script
+        // never did. Without it: "fatal error C1083: Cannot open include
+        // file: 'strings.h'". litehtml-rs issue #2 tracks this.
+        gumbo_build.include(gumbo_src.join("visualc/include"));
+    } else {
+        // -std=c99 is meaningless to cl.exe (MSVC warns and ignores it, so
+        // it's harmless there, but only set it where it's actually honored).
+        gumbo_build.std("c99");
+    }
+    gumbo_build.compile("gumbo");
 
     // litehtml (C++17)
-    cc::Build::new()
+    let mut litehtml_build = cc::Build::new();
+    litehtml_build
         .cargo_metadata(false)
         .cpp(true)
         .files(
@@ -129,30 +143,58 @@ fn build_vendored(manifest_dir: &Path, out_dir: &Path, csrc_dir: &Path) {
         .include(&litehtml_src)
         .include(&gumbo_include)
         .std("c++17")
-        .warnings(false)
-        .compile("litehtml");
+        .warnings(false);
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        // Two separate MSVC-vs-GCC/Clang portability gaps in litehtml's own
+        // C++ source, on top of gumbo's -- neither is an MSVC bug, both are
+        // "code written against a more permissive compiler":
+        //  - media_query.cpp (and possibly others) uses non-ASCII UTF-16
+        //    char literals (u'⩾' etc, for CSS media-query comparison
+        //    operators). MSVC parses source files using the *system*
+        //    codepage unless told otherwise, so without /utf-8 it
+        //    misreads the multi-byte UTF-8 encoding of those characters
+        //    as more than one char crammed into a `u'...'` literal --
+        //    "error C2015: too many characters in constant".
+        //  - Same files also use C++'s alternative operator tokens
+        //    (`not`/`and`/`or` for `!`/`&&`/`||`) -- valid standard C++,
+        //    but MSVC only recognizes them if <ciso646> has been
+        //    included somewhere (unlike GCC/Clang, which treat them as
+        //    built-in keywords unconditionally); without it MSVC parses
+        //    plain `not` as an undeclared identifier ("error C2065").
+        //    /FI force-includes it into every translation unit without
+        //    touching a single source file.
+        litehtml_build.flag("/utf-8").flag("/FIciso646");
+    }
+    litehtml_build.compile("litehtml");
 
     // C wrapper (C++17)
-    cc::Build::new()
+    let mut wrapper_build = cc::Build::new();
+    wrapper_build
         .cargo_metadata(false)
         .cpp(true)
         .file(csrc_dir.join("litehtml_c.cpp"))
         .include(&litehtml_include)
         .include(&gumbo_include)
         .std("c++17")
-        .warnings(false)
-        .compile("litehtml_c");
+        .warnings(false);
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        wrapper_build.flag("/utf-8").flag("/FIciso646");
+    }
+    wrapper_build.compile("litehtml_c");
 
     // Link order: dependents first
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=litehtml_c");
     println!("cargo:rustc-link-lib=static=litehtml");
     println!("cargo:rustc-link-lib=static=gumbo");
-    // Link C++ standard library
-    if cfg!(target_os = "macos") {
-        println!("cargo:rustc-link-lib=c++");
-    } else {
-        println!("cargo:rustc-link-lib=stdc++");
+    // Link C++ standard library -- MSVC has no separate libstdc++/libc++ to
+    // name (its C++ runtime is pulled in implicitly via /defaultlib:msvcrt,
+    // already in the link line), so naming one at all makes link.exe fail
+    // with LNK1181 "cannot open input file 'stdc++.lib'".
+    match env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("macos") => println!("cargo:rustc-link-lib=c++"),
+        Ok("windows") => {}
+        _ => println!("cargo:rustc-link-lib=stdc++"),
     }
 
     println!("cargo:rerun-if-changed={}", vendor_dir.display());
