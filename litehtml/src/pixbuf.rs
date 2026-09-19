@@ -14,7 +14,7 @@ use tiny_skia::{
 };
 
 use crate::{
-    BackgroundLayer, BorderRadiuses, BorderStyle, Borders, Color, ColorPoint, ConicGradient,
+    BackgroundLayer, BackgroundRepeat, BorderRadiuses, BorderStyle, Borders, Color, ColorPoint, ConicGradient,
     DocumentContainer, DrawContext, FontDescription, FontHandle, FontMetrics, FontStyle,
     LinearGradient, ListMarker, ListStyleType, MediaFeatures, MediaType, Position, RadialGradient,
     Size, TextTransform,
@@ -353,6 +353,30 @@ fn attrs_from_font<'a>(font: &'a FontData) -> Attrs<'a> {
         .family(family)
         .weight(font.weight)
         .style(font.style)
+}
+
+/// Most tiles `draw_image` will lay out along one axis of a repeated
+/// background.
+const MAX_TILES_PER_AXIS: usize = 2048;
+
+/// Origins (along one axis) of every tile of a background image of `size`
+/// starting at `origin`, that could be visible inside `[clip_start,
+/// clip_end)`. A single origin when `repeat` is false.
+fn tile_starts(origin: f32, size: f32, clip_start: f32, clip_end: f32, repeat: bool) -> Vec<f32> {
+    if !repeat || size <= 0.0 {
+        return vec![origin];
+    }
+    // Largest `origin + k*size` that is still <= clip_start.
+    let k = ((origin - clip_start) / size).ceil();
+    let mut x = origin - k * size;
+    let mut out = Vec::new();
+    // Bounded: `size` comes from sender-controlled CSS (`background-size`),
+    // and a tiny one over a wide clip box must not allocate without limit.
+    while x < clip_end && out.len() < MAX_TILES_PER_AXIS {
+        out.push(x);
+        x += size;
+    }
+    out
 }
 
 /// Intersect two masks by taking the minimum alpha of each pixel.
@@ -834,54 +858,115 @@ impl DocumentContainer for PixbufContainer {
         let Some(img) = self.images.get(url) else {
             return;
         };
-        let clip = layer.clip_box();
-        let border = layer.border_box();
+        let (img_w, img_h) = (img.width() as f32, img.height() as f32);
+        if img_w <= 0.0 || img_h <= 0.0 {
+            return;
+        }
         let s = self.scale_factor;
 
-        let dst_x = (border.x * s) as i32;
-        let dst_y = (border.y * s) as i32;
-
-        let img_paint = tiny_skia::PixmapPaint {
-            opacity: 1.0,
-            blend_mode: tiny_skia::BlendMode::SourceOver,
-            quality: tiny_skia::FilterQuality::Bilinear,
+        // `origin_box` is the rectangle litehtml computed for one tile of the
+        // image *after* applying `width`/`height` attributes, `max-width`,
+        // `background-size` and `background-position` (see
+        // `litehtml::background::...` in background.cpp). It is what has to
+        // be drawn: the image is scaled to it, not blitted at its natural
+        // size (which crops or mis-sizes any image whose displayed size
+        // differs from its pixel size -- i.e. most HTML email images).
+        // Fall back to the natural size if litehtml handed us nothing usable.
+        let origin = layer.origin_box();
+        let (tile_w, tile_h) = if origin.width > 0.0 && origin.height > 0.0 {
+            (origin.width, origin.height)
+        } else {
+            (img_w / s, img_h / s)
         };
 
-        if clip.width > 0.0 && clip.height > 0.0 {
-            let w = self.pixmap.width();
-            let h = self.pixmap.height();
-            if let Some(mut m) = tiny_skia::Mask::new(w, h) {
-                if let Some(rect) =
-                    Rect::from_xywh(clip.x * s, clip.y * s, clip.width * s, clip.height * s)
-                {
-                    m.fill_path(
-                        &PathBuilder::from_rect(rect),
-                        FillRule::Winding,
-                        true,
-                        Transform::identity(),
-                    );
-                }
+        // `clip_box` bounds where the background may paint; a degenerate one
+        // means "unclipped", as before.
+        let clip_box = layer.clip_box();
+        let clip = if clip_box.width > 0.0 && clip_box.height > 0.0 {
+            clip_box
+        } else {
+            Position {
+                x: origin.x,
+                y: origin.y,
+                width: tile_w,
+                height: tile_h,
+            }
+        };
+
+        let repeat = layer.repeat();
+        let repeat_x = matches!(repeat, BackgroundRepeat::Repeat | BackgroundRepeat::RepeatX);
+        let repeat_y = matches!(repeat, BackgroundRepeat::Repeat | BackgroundRepeat::RepeatY);
+        let xs = tile_starts(origin.x, tile_w, clip.x, clip.x + clip.width, repeat_x);
+        let ys = tile_starts(origin.y, tile_h, clip.y, clip.y + clip.height, repeat_y);
+
+        // Only build a dedicated clip mask when some tile actually spills
+        // outside the clip box (repeated backgrounds, cropped backgrounds);
+        // a plain `<img>` sits entirely inside it, and building a
+        // full-canvas mask per image is not free on a tall message.
+        let eps = 0.5;
+        let spills = xs.first().is_some_and(|&x| x < clip.x - eps)
+            || xs.last().is_some_and(|&x| x + tile_w > clip.x + clip.width + eps)
+            || ys.first().is_some_and(|&y| y < clip.y - eps)
+            || ys.last().is_some_and(|&y| y + tile_h > clip.y + clip.height + eps);
+        let local_mask = if spills {
+            tiny_skia::Mask::new(self.pixmap.width(), self.pixmap.height()).and_then(|mut m| {
+                let rect =
+                    Rect::from_xywh(clip.x * s, clip.y * s, clip.width * s, clip.height * s)?;
+                m.fill_path(
+                    &PathBuilder::from_rect(rect),
+                    FillRule::Winding,
+                    true,
+                    Transform::identity(),
+                );
                 if let Some(ref existing) = self.cached_clip_mask {
                     intersect_masks(&mut m, existing);
                 }
+                Some(m)
+            })
+        } else {
+            None
+        };
+        let mask = local_mask.as_ref().or(self.cached_clip_mask.as_ref());
+
+        // Snap each tile's destination to whole device pixels so edges stay
+        // crisp and adjacent tiles do not leave seams; the scale is then
+        // derived from the snapped size.
+        let dst_w = (tile_w * s).round().max(1.0);
+        let dst_h = (tile_h * s).round().max(1.0);
+        let sx = dst_w / img_w;
+        let sy = dst_h / img_h;
+        let scaled = (sx - 1.0).abs() > 1e-3 || (sy - 1.0).abs() > 1e-3;
+        let img_paint = tiny_skia::PixmapPaint {
+            opacity: 1.0,
+            blend_mode: tiny_skia::BlendMode::SourceOver,
+            quality: if scaled {
+                tiny_skia::FilterQuality::Bicubic
+            } else {
+                tiny_skia::FilterQuality::Nearest
+            },
+        };
+
+        // A repeat over a huge clip box with a tiny tile would otherwise
+        // loop for a very long time for no visible benefit.
+        const MAX_TILES: usize = 20_000;
+        let mut drawn = 0usize;
+        'rows: for &y in &ys {
+            for &x in &xs {
+                if drawn >= MAX_TILES {
+                    break 'rows;
+                }
+                drawn += 1;
+                let tx = (x * s).round();
+                let ty = (y * s).round();
                 self.pixmap.draw_pixmap(
-                    dst_x,
-                    dst_y,
+                    0,
+                    0,
                     img.as_ref(),
                     &img_paint,
-                    Transform::identity(),
-                    Some(&m),
+                    Transform::from_row(sx, 0.0, 0.0, sy, tx, ty),
+                    mask,
                 );
             }
-        } else {
-            self.pixmap.draw_pixmap(
-                dst_x,
-                dst_y,
-                img.as_ref(),
-                &img_paint,
-                Transform::identity(),
-                self.cached_clip_mask.as_ref(),
-            );
         }
     }
 
@@ -1384,4 +1469,102 @@ pub fn render_to_rgba_scaled(html: &str, width: u32, height: u32, scale_factor: 
         );
     }
     container.pixels().to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Document;
+
+    /// Encode a `w`x`h` PNG whose pixel at `(x, y)` is `color(x, y)`.
+    fn png(w: u32, h: u32, color: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
+        let img = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(color(x, y)));
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).unwrap();
+        out.into_inner()
+    }
+
+    /// Lay out and draw `html` (with `images` pre-loaded, so their natural
+    /// sizes are known at layout time) into a `w`x`h` container.
+    fn render(html: &str, images: &[(&str, Vec<u8>)], w: u32, h: u32) -> PixbufContainer {
+        let mut c = PixbufContainer::new(w, h);
+        for (url, bytes) in images {
+            c.load_image_data(url, bytes);
+        }
+        let mut doc = Document::from_html(html, &mut c, None, None).unwrap();
+        let _ = doc.render(w as f32);
+        doc.draw(DrawContext::default(), 0.0, 0.0, None);
+        drop(doc);
+        c
+    }
+
+    fn pixel(c: &PixbufContainer, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * c.width() + x) * 4) as usize;
+        c.pixels()[i..i + 4].try_into().unwrap()
+    }
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const BLUE: [u8; 4] = [0, 0, 255, 255];
+    const CLEAR: [u8; 4] = [0, 0, 0, 0];
+
+    #[test]
+    fn img_is_scaled_to_its_laid_out_size_not_drawn_at_natural_size() {
+        // A 1x1 image shown at 100x100 must fill that box. Drawn at its
+        // natural size (the old behaviour) it was a single pixel.
+        let c = render(
+            r#"<body style="margin:0"><img src="red.png" width="100" height="100"></body>"#,
+            &[("red.png", png(1, 1, |_, _| RED))],
+            200,
+            120,
+        );
+        for (x, y) in [(1, 1), (50, 50), (98, 98)] {
+            assert_eq!(pixel(&c, x, y), RED, "inside the image at ({x},{y})");
+        }
+        assert_eq!(pixel(&c, 150, 50), CLEAR, "outside the image");
+    }
+
+    #[test]
+    fn large_img_is_scaled_down_instead_of_cropped() {
+        // A 400x200 image shown at 100x50: the right-hand half is blue, and
+        // that must still be visible (cropping would show only the left,
+        // red, top-left 100x50 of the original).
+        let c = render(
+            r#"<body style="margin:0"><img src="i.png" width="100" height="50"></body>"#,
+            &[("i.png", png(400, 200, |x, _| if x < 200 { RED } else { BLUE }))],
+            200,
+            120,
+        );
+        assert_eq!(pixel(&c, 20, 25), RED);
+        assert_eq!(pixel(&c, 80, 25), BLUE);
+    }
+
+    #[test]
+    fn background_repeat_x_tiles_the_image() {
+        // A 20x10 image (left half red, right half blue), repeated across a
+        // 40px box. Natural size, so no interpolation blurs the colours.
+        let c = render(
+            r#"<body style="margin:0"><div style="width:40px;height:10px;background:url(t.png) repeat-x"></div></body>"#,
+            &[("t.png", png(20, 10, |x, _| if x < 10 { RED } else { BLUE }))],
+            100,
+            30,
+        );
+        assert_eq!(pixel(&c, 5, 5), RED);
+        assert_eq!(pixel(&c, 15, 5), BLUE);
+        assert_eq!(pixel(&c, 25, 5), RED, "second tile");
+        assert_eq!(pixel(&c, 35, 5), BLUE, "second tile");
+        assert_eq!(pixel(&c, 45, 5), CLEAR, "outside the box");
+    }
+
+    #[test]
+    fn background_with_tiny_size_does_not_allocate_unboundedly() {
+        // `background-size` is author-controlled; a tiny tile over a wide box
+        // must not build an enormous tile list.
+        let c = render(
+            r#"<body style="margin:0"><div style="width:90px;height:10px;background:url(t.png) repeat;background-size:0.0001px 0.0001px"></div></body>"#,
+            &[("t.png", png(1, 1, |_, _| RED))],
+            100,
+            30,
+        );
+        assert_eq!(c.width(), 100);
+    }
 }
