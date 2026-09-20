@@ -367,6 +367,19 @@ void lh_element_get_text(lh_element_t* el,
                          void (*cb)(void* ctx, const char* text),
                          void* ctx);
 
+/* Get the element's tag name (e.g. "a", "div"; empty for text nodes) via
+ * callback. The string is only valid for the duration of the callback. */
+void lh_element_get_tag_name(lh_element_t* el,
+                             void (*cb)(void* ctx, const char* name),
+                             void* ctx);
+
+/* Get the value of the attribute `name` via callback. Returns 1 and calls
+ * `cb` if the element has the attribute (an empty value counts), 0 otherwise.
+ * The string is only valid for the duration of the callback. */
+int lh_element_get_attr(lh_element_t* el, const char* name,
+                        void (*cb)(void* ctx, const char* value),
+                        void* ctx);
+
 /* Hit testing: find the deepest element at document coordinates (x, y). */
 lh_element_t* lh_document_get_element_by_point(lh_document_t* doc,
                                                 float x, float y,

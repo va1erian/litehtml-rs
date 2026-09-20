@@ -2045,6 +2045,57 @@ impl<'a> Element<'a> {
         result
     }
 
+    /// The element's tag name, lower-case (`"a"`, `"div"`, ...). Empty for a
+    /// text node.
+    pub fn tag_name(&self) -> String {
+        unsafe extern "C" fn callback(ctx: *mut c_void, name: *const c_char) {
+            if name.is_null() || ctx.is_null() {
+                return;
+            }
+            let result = &mut *(ctx as *mut String);
+            if let Ok(s) = CStr::from_ptr(name).to_str() {
+                result.push_str(s);
+            }
+        }
+
+        let mut result = String::new();
+        unsafe {
+            sys::lh_element_get_tag_name(
+                self.ptr,
+                Some(callback),
+                &mut result as *mut String as *mut c_void,
+            );
+        }
+        result
+    }
+
+    /// The value of the attribute `name` (e.g. `"href"`), or `None` if the
+    /// element does not have it. An attribute with an empty value is
+    /// `Some("")`.
+    pub fn attr(&self, name: &str) -> Option<String> {
+        unsafe extern "C" fn callback(ctx: *mut c_void, value: *const c_char) {
+            if value.is_null() || ctx.is_null() {
+                return;
+            }
+            let result = &mut *(ctx as *mut String);
+            if let Ok(s) = CStr::from_ptr(value).to_str() {
+                result.push_str(s);
+            }
+        }
+
+        let c_name = CString::new(name).ok()?;
+        let mut result = String::new();
+        let found = unsafe {
+            sys::lh_element_get_attr(
+                self.ptr,
+                c_name.as_ptr(),
+                Some(callback),
+                &mut result as *mut String as *mut c_void,
+            )
+        };
+        (found != 0).then_some(result)
+    }
+
     /// Number of per-line inline boxes (0 if not an inline element).
     pub fn inline_boxes_count(&self) -> usize {
         unsafe { sys::lh_element_get_inline_boxes_count(self.ptr) as usize }
@@ -2674,6 +2725,50 @@ mod tests {
 
         let root = doc.root().unwrap();
         assert!(find_text_node(&root), "should find at least one text node");
+    }
+
+    /// Every element of `doc` in document order.
+    fn all_elements<'a>(doc: &'a Document<'_>) -> Vec<Element<'a>> {
+        let mut out = Vec::new();
+        let mut stack = vec![doc.root().unwrap()];
+        while let Some(el) = stack.pop() {
+            for i in (0..el.children_count()).rev() {
+                stack.push(el.child_at(i).unwrap());
+            }
+            out.push(el);
+        }
+        out
+    }
+
+    #[test]
+    fn test_element_tag_name_and_attr() {
+        let mut container = TestContainer::new();
+        let html = r#"<div id="d"><a href="https://example.com/?a=1&amp;b=2" class="">link</a><a name="x">no href</a><img src="p.png" alt=""></div>"#;
+        let mut doc = Document::from_html(html, &mut container, None, None).unwrap();
+        let _ = doc.render(800.0);
+        let els = all_elements(&doc);
+
+        let anchors: Vec<_> = els.iter().filter(|e| e.tag_name() == "a").collect();
+        assert_eq!(anchors.len(), 2);
+        // Entities are decoded, as the parser stores them.
+        assert_eq!(anchors[0].attr("href").as_deref(), Some("https://example.com/?a=1&b=2"));
+        // An attribute present with an empty value is `Some("")`; a missing one is `None`.
+        assert_eq!(anchors[0].attr("class").as_deref(), Some(""));
+        assert_eq!(anchors[1].attr("href"), None);
+        assert_eq!(anchors[1].attr("name").as_deref(), Some("x"));
+
+        let div = els.iter().find(|e| e.tag_name() == "div").unwrap();
+        assert_eq!(div.attr("id").as_deref(), Some("d"));
+        let img = els.iter().find(|e| e.tag_name() == "img").unwrap();
+        assert_eq!(img.attr("src").as_deref(), Some("p.png"));
+        assert_eq!(img.attr("alt").as_deref(), Some(""));
+
+        // Text nodes have no tag and no attributes.
+        let text = els.iter().find(|e| e.is_text()).unwrap();
+        assert_eq!(text.tag_name(), "");
+        assert_eq!(text.attr("href"), None);
+        // A name with an interior NUL cannot match anything.
+        assert_eq!(div.attr("i d"), None);
     }
 
     #[test]

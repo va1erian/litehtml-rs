@@ -797,6 +797,31 @@ unsafe extern "C" {
     );
 }
 unsafe extern "C" {
+    pub fn lh_element_get_tag_name(
+        el: *mut lh_element_t,
+        cb: ::std::option::Option<
+            unsafe extern "C" fn(
+                ctx: *mut ::std::os::raw::c_void,
+                name: *const ::std::os::raw::c_char,
+            ),
+        >,
+        ctx: *mut ::std::os::raw::c_void,
+    );
+}
+unsafe extern "C" {
+    pub fn lh_element_get_attr(
+        el: *mut lh_element_t,
+        name: *const ::std::os::raw::c_char,
+        cb: ::std::option::Option<
+            unsafe extern "C" fn(
+                ctx: *mut ::std::os::raw::c_void,
+                value: *const ::std::os::raw::c_char,
+            ),
+        >,
+        ctx: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
     pub fn lh_document_get_element_by_point(
         doc: *mut lh_document_t,
         x: f32,

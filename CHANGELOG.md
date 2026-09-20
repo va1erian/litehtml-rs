@@ -1,3 +1,8 @@
+## [Unreleased]
+
+### Added
+- `Element::tag_name()` and `Element::attr(name)` (with `lh_element_get_tag_name` / `lh_element_get_attr` in the C shim), so hosts can read an element's tag and attributes such as an anchor's `href`
+
 ## [0.2.6] - 2026-07-01
 
 ### Added

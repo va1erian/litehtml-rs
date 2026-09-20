@@ -1536,6 +1536,35 @@ void lh_element_get_text(lh_element_t* el,
     }
 }
 
+void lh_element_get_tag_name(lh_element_t* el,
+                             void (*cb)(void* ctx, const char* name),
+                             void* ctx)
+{
+    try {
+        if (!el || !cb) return;
+        auto* elem = reinterpret_cast<litehtml::element*>(el);
+        const char* name = elem->get_tagName();
+        cb(ctx, name ? name : "");
+    } catch (...) {
+    }
+}
+
+int lh_element_get_attr(lh_element_t* el, const char* name,
+                        void (*cb)(void* ctx, const char* value),
+                        void* ctx)
+{
+    try {
+        if (!el || !name || !cb) return 0;
+        auto* elem = reinterpret_cast<litehtml::element*>(el);
+        const char* value = elem->get_attr(name, nullptr);
+        if (!value) return 0;
+        cb(ctx, value);
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
 lh_element_t* lh_document_get_element_by_point(lh_document_t* doc,
                                                 float x, float y,
                                                 float client_x, float client_y)
